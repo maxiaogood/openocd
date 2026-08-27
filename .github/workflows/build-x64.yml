@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Build x64 (static)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            extra_packages: libudev-dev
+          - target: windows-x64
+            extra_packages: g++-mingw-w64-x86-64
+    env:
+      DL_DIR: ${{ github.workspace }}/../downloads
+      BUILD_DIR: ${{ github.workspace }}/../build-${{ matrix.target }}
+      STAGING: ${{ github.workspace }}/../staging-${{ matrix.target }}
+      MAKE_JOBS: "4"
+    steps:
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autotools-dev autoconf automake libtool pkg-config cmake \
+            texinfo wget zip unzip file \
+            ${{ matrix.extra_packages }}
+
+      - name: Prefer MinGW POSIX toolchain
+        if: matrix.target == 'windows-x64'
+        run: |
+          if update-alternatives --list x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+            sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bootstrap OpenOCD
+        run: ./bootstrap
+
+      - name: Fetch third-party sources
+        run: bash .github/scripts/fetch-deps.sh
+
+      - name: Resolve version
+        run: |
+          TAG="$(git tag --points-at HEAD | head -n1 || true)"
+          if [ -z "$TAG" ]; then
+            TAG="$(git rev-parse --short HEAD)"
+          fi
+          echo "OPENOCD_TAG=${TAG}" >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.target }}
+        env:
+          OPENOCD_SRC: ${{ github.workspace }}
+        run: bash .github/scripts/build-static.sh ${{ matrix.target }}
+
+      - name: Pack linux-x64
+        if: matrix.target == 'linux-x64'
+        run: |
+          ARTIFACT="openocd-${OPENOCD_TAG}-linux-x64.tar.gz"
+          tar -C "${STAGING}/.." -czf "${{ github.workspace }}/${ARTIFACT}" \
+            --transform "s|^staging-${{ matrix.target }}|openocd-${OPENOCD_TAG}-linux-x64|" \
+            "staging-${{ matrix.target }}"
+          echo "ARTIFACT=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      - name: Pack windows-x64
+        if: matrix.target == 'windows-x64'
+        run: |
+          ARTIFACT="openocd-${OPENOCD_TAG}-windows-x64.zip"
+          STAGE_NAME="openocd-${OPENOCD_TAG}-windows-x64"
+          rm -rf "${{ github.workspace }}/../${STAGE_NAME}"
+          cp -a "${STAGING}" "${{ github.workspace }}/../${STAGE_NAME}"
+          ( cd "${{ github.workspace }}/.." && zip -r "${{ github.workspace }}/${ARTIFACT}" "${STAGE_NAME}" )
+          echo "ARTIFACT=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openocd-${{ env.OPENOCD_TAG }}-${{ matrix.target }}
+          path: ${{ github.workspace }}/${{ env.ARTIFACT }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: dist/*
+          generateReleaseNotes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
