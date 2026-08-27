@@ -8,7 +8,9 @@ name: OpenOCD Snapshot
 
 jobs:
   package:
-    runs-on: [ubuntu-latest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       DL_DIR: ../downloads
       BUILD_DIR: ../build
@@ -18,7 +20,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install autotools-dev autoconf automake libtool pkg-config cmake texinfo texlive g++-mingw-w64-i686
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - run: ./bootstrap
       - name: Prepare libusb1
         env:
@@ -114,18 +116,19 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           path: ${{ env.ARTIFACT_PATH }}
-      - name: Delete 'latest' Release
-        uses: dev-drprasad/delete-tag-and-release@v1.1
-        with:
-          delete_release: true
-          tag_name: ${{ env.RELEASE_NAME }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create Release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: ${{ env.RELEASE_NAME }}
-          commit: ${{ github.sha }}
-          draft: false
-          artifacts: ${{ env.ARTIFACT_PATH }}
-          prerelease: ${{ env.IS_PRE_RELEASE }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish snapshot release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PRE_FLAG=()
+          if [ "${IS_PRE_RELEASE}" = "true" ]; then
+            PRE_FLAG=(--prerelease)
+          fi
+          # Recreate the moving "latest" tag without the deprecated Node 20 action.
+          gh release delete "${RELEASE_NAME}" --yes --cleanup-tag || true
+          gh release create "${RELEASE_NAME}" "${ARTIFACT_PATH}" \
+            --target "${{ github.sha }}" \
+            --title "${RELEASE_NAME}" \
+            --notes "Automated Windows i686 snapshot from ${{ github.sha }}" \
+            "${PRE_FLAG[@]}"
