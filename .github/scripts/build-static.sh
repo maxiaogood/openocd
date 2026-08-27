@@ -66,6 +66,41 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 EOF
 }
 
+# llvm-mingw is Clang; GCC-only flags such as -mwin32 (injected by libusb)
+# must be stripped or the Windows ARM64 build dies.
+setup_clang_flag_filter() {
+  local host="$1"
+  local wrap_dir="$2"
+  local real_cc real_cxx
+  real_cc="$(command -v "${host}-gcc")"
+  real_cxx="$(command -v "${host}-g++")"
+  mkdir -p "${wrap_dir}"
+  cat > "${wrap_dir}/${host}-gcc" <<EOF
+#!/usr/bin/env bash
+args=()
+for a in "\$@"; do
+  case "\$a" in
+    -mwin32|-static-libgcc) continue ;;
+  esac
+  args+=("\$a")
+done
+exec "${real_cc}" "\${args[@]}"
+EOF
+  cat > "${wrap_dir}/${host}-g++" <<EOF
+#!/usr/bin/env bash
+args=()
+for a in "\$@"; do
+  case "\$a" in
+    -mwin32|-static-libgcc) continue ;;
+  esac
+  args+=("\$a")
+done
+exec "${real_cxx}" "\${args[@]}"
+EOF
+  chmod +x "${wrap_dir}/${host}-gcc" "${wrap_dir}/${host}-g++"
+  export PATH="${wrap_dir}:${PATH}"
+}
+
 package_tree() {
   local src_root="$1"
   mkdir -p "${STAGING}/bin" "${STAGING}/share"
@@ -99,6 +134,9 @@ build_windows() {
   ensure_libftdi_mingw_toolchain "${host}"
   mkdir -p "${BUILD_DIR}"
   setup_pkgconfig_shim "${BUILD_DIR}/pkgconfig-shim"
+  if "${host}-gcc" --version 2>/dev/null | grep -qi clang; then
+    setup_clang_flag_filter "${host}" "${BUILD_DIR}/clang-flag-filter"
+  fi
   cd "${BUILD_DIR}"
   bash "${OPENOCD_SRC}/contrib/cross-build.sh" "${host}"
   package_tree "${BUILD_DIR}/${host}-root/usr"
