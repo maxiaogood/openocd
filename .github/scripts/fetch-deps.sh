@@ -29,6 +29,12 @@ wget -nv -O "libftdi1-${LIBFTDI_VER}.tar.bz2" \
   "https://www.intra2net.com/en/developer/libftdi/download/libftdi1-${LIBFTDI_VER}.tar.bz2"
 tar -xjf "libftdi1-${LIBFTDI_VER}.tar.bz2"
 LIBFTDI_SRC="${DL_DIR}/libftdi1-${LIBFTDI_VER}"
+# libftdi always adds a shared 'ftdi1' target regardless of BUILD_SHARED_LIBS,
+# and linking it against a static libusb fails. Build the only target as static
+# instead; STATICLIBS must then stay OFF to avoid two targets named libftdi1.a.
+sed -i 's/add_library(ftdi1 SHARED/add_library(ftdi1 STATIC/' \
+  "${LIBFTDI_SRC}/src/CMakeLists.txt"
+grep -q 'add_library(ftdi1 STATIC' "${LIBFTDI_SRC}/src/CMakeLists.txt"
 
 wget -nv -O "capstone-${CAPSTONE_VER}.tar.gz" \
   "https://github.com/aquynh/capstone/archive/${CAPSTONE_VER}.tar.gz"

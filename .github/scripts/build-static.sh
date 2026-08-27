@@ -33,6 +33,21 @@ EOF
   rm -f "${pc_file}.hdr"
 }
 
+# Static linking needs Libs.private, so force --static on every pkg-config
+# invocation, including the ones cmake and cross-build.sh make on their own.
+setup_pkgconfig_shim() {
+  local shim_dir="$1"
+  local real_pkg_config
+  real_pkg_config="$(command -v pkg-config)"
+  mkdir -p "${shim_dir}"
+  cat > "${shim_dir}/pkg-config" <<EOF
+#!/bin/sh
+exec ${real_pkg_config} --static "\$@"
+EOF
+  chmod +x "${shim_dir}/pkg-config"
+  export PATH="${shim_dir}:${PATH}"
+}
+
 package_tree() {
   local src_root="$1"
   mkdir -p "${STAGING}/bin" "${STAGING}/share"
@@ -56,7 +71,7 @@ case "${TARGET}" in
     export OPENOCD_TAG="${OPENOCD_TAG:-$(git -C "${OPENOCD_SRC}" rev-parse --short HEAD)}"
     export LIBUSB1_CONFIG="--enable-static --disable-shared"
     export HIDAPI_CONFIG="--enable-static --disable-shared --disable-testgui"
-    export LIBFTDI_CONFIG="-DSTATICLIBS=ON -DBUILD_SHARED_LIBS=OFF -DEXAMPLES=OFF -DFTDI_EEPROM=OFF -DBUILD_TESTS=OFF -DCMAKE_INSTALL_LIBDIR=lib"
+    export LIBFTDI_CONFIG="-DSTATICLIBS=OFF -DLIB_SUFFIX= -DEXAMPLES=OFF -DFTDI_EEPROM=OFF -DBUILD_TESTS=OFF -DDOCUMENTATION=OFF -DFTDIPP=OFF -DPYTHON_BINDINGS=OFF"
     export CAPSTONE_CONFIG="CAPSTONE_BUILD_CORE_ONLY=yes CAPSTONE_STATIC=yes CAPSTONE_SHARED=no"
     export LIBJAYLINK_CONFIG="--enable-static --disable-shared"
     export JIMTCL_CONFIG="--disable-shared --with-ext=json --minimal --disable-ssl"
@@ -64,6 +79,7 @@ case "${TARGET}" in
     export OPENOCD_CONFIG="LDFLAGS=-static"
     export MAKE_JOBS
     mkdir -p "${BUILD_DIR}"
+    setup_pkgconfig_shim "${BUILD_DIR}/pkgconfig-shim"
     cd "${BUILD_DIR}"
     bash "${OPENOCD_SRC}/contrib/cross-build.sh" "${HOST}"
     package_tree "${BUILD_DIR}/${HOST}-root/usr"
@@ -81,25 +97,21 @@ case "${TARGET}" in
     export CMAKE_PREFIX_PATH="${PREFIX}"
     export CPPFLAGS="-I${PREFIX}/include"
     export LDFLAGS="-L${PREFIX}/lib -static-libgcc"
-    PKG_CONFIG_WRAP="${BUILD_DIR}/pkg-config-static"
-    mkdir -p "${BUILD_DIR}"
-    cat > "${PKG_CONFIG_WRAP}" <<'EOF'
-#!/bin/sh
-exec pkg-config --static "$@"
-EOF
-    chmod +x "${PKG_CONFIG_WRAP}"
-    export PKG_CONFIG="${PKG_CONFIG_WRAP}"
+    setup_pkgconfig_shim "${BUILD_DIR}/pkgconfig-shim"
+    export PKG_CONFIG="${BUILD_DIR}/pkgconfig-shim/pkg-config"
 
     # libusb: static library; udev remains a system shared library (no static libudev on Ubuntu).
     mkdir -p "${BUILD_DIR}/libusb1"
     cd "${BUILD_DIR}/libusb1"
-    "${LIBUSB1_SRC}/configure" --prefix="${PREFIX}" --enable-static --disable-shared
+    "${LIBUSB1_SRC}/configure" --prefix="${PREFIX}" \
+      --enable-static --disable-shared --with-pic
     make -j "${MAKE_JOBS}"
     make install
 
     mkdir -p "${BUILD_DIR}/hidapi"
     cd "${BUILD_DIR}/hidapi"
-    "${HIDAPI_SRC}/configure" --prefix="${PREFIX}" --enable-static --disable-shared --disable-testgui
+    "${HIDAPI_SRC}/configure" --prefix="${PREFIX}" \
+      --enable-static --disable-shared --disable-testgui --with-pic
     make -j "${MAKE_JOBS}"
     make install
 
@@ -108,13 +120,15 @@ EOF
     cmake "${LIBFTDI_SRC}" \
       -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
       -DCMAKE_PREFIX_PATH="${PREFIX}" \
-      -DCMAKE_INSTALL_LIBDIR=lib \
-      -DPKG_CONFIG_EXECUTABLE="$(command -v pkg-config)" \
-      -DSTATICLIBS=ON \
-      -DBUILD_SHARED_LIBS=OFF \
+      -DPKG_CONFIG_EXECUTABLE="${PKG_CONFIG}" \
+      -DLIB_SUFFIX= \
+      -DSTATICLIBS=OFF \
       -DEXAMPLES=OFF \
       -DFTDI_EEPROM=OFF \
-      -DBUILD_TESTS=OFF
+      -DFTDIPP=OFF \
+      -DPYTHON_BINDINGS=OFF \
+      -DBUILD_TESTS=OFF \
+      -DDOCUMENTATION=OFF
     make -j "${MAKE_JOBS}"
     make install
 
@@ -129,7 +143,8 @@ EOF
 
     mkdir -p "${BUILD_DIR}/libjaylink"
     cd "${BUILD_DIR}/libjaylink"
-    "${LIBJAYLINK_SRC}/configure" --prefix="${PREFIX}" --enable-static --disable-shared
+    "${LIBJAYLINK_SRC}/configure" --prefix="${PREFIX}" \
+      --enable-static --disable-shared --with-pic
     make -j "${MAKE_JOBS}"
     make install
 
@@ -139,6 +154,9 @@ EOF
       --with-ext=json --minimal --disable-ssl
     make -j "${MAKE_JOBS}"
     make install
+
+    # Leave the linker no choice but the static archives.
+    rm -f "${PREFIX}"/lib/*.so "${PREFIX}"/lib/*.so.*
 
     mkdir -p "${BUILD_DIR}/openocd"
     cd "${BUILD_DIR}/openocd"
