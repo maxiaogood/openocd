@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  LLVM_MINGW_VER: "20260616"
+
+jobs:
+  meta:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+      prerelease: ${{ steps.id.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: id
+        run: |
+          SHA="$(git rev-parse --short HEAD)"
+          STAMP="$(date -u +%Y%m%d-%H%M)"
+          TAG="$(git tag --points-at HEAD | grep -v '^latest$' | head -n1 || true)"
+          if [ -n "$TAG" ]; then
+            echo "build_id=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_id=${STAMP}-${SHA}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.target }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-latest
+            extra_packages: libudev-dev
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            extra_packages: libudev-dev
+          - target: windows-x64
+            runner: ubuntu-latest
+            extra_packages: g++-mingw-w64-x86-64
+          - target: windows-arm64
+            runner: ubuntu-latest
+            extra_packages: ""
+    env:
+      DL_DIR: ${{ github.workspace }}/../downloads
+      BUILD_DIR: ${{ github.workspace }}/../build-${{ matrix.target }}
+      STAGING: ${{ github.workspace }}/../staging-${{ matrix.target }}
+      MAKE_JOBS: "4"
+      OPENOCD_TAG: ${{ needs.meta.outputs.build_id }}
+    steps:
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autotools-dev autoconf automake libtool pkg-config cmake \
+            texinfo wget zip unzip file xz-utils \
+            ${{ matrix.extra_packages }}
+
+      - name: Prefer MinGW POSIX toolchain
+        if: matrix.target == 'windows-x64'
+        run: |
+          if update-alternatives --list x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+            sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+          fi
+
+      - name: Install llvm-mingw (Windows ARM64)
+        if: matrix.target == 'windows-arm64'
+        run: |
+          set -euo pipefail
+          ARCHIVE="llvm-mingw-${LLVM_MINGW_VER}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          wget -nv -O "/tmp/${ARCHIVE}" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VER}/${ARCHIVE}"
+          sudo mkdir -p /opt/llvm-mingw
+          sudo tar -xJf "/tmp/${ARCHIVE}" -C /opt/llvm-mingw --strip-components=1
+          echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Bootstrap OpenOCD
+        run: ./bootstrap
+
+      - name: Fetch third-party sources
+        run: bash .github/scripts/fetch-deps.sh
+
+      - name: Build ${{ matrix.target }}
+        env:
+          OPENOCD_SRC: ${{ github.workspace }}
+        run: bash .github/scripts/build-static.sh ${{ matrix.target }}
+
+      - name: Pack linux
+        if: startsWith(matrix.target, 'linux-')
+        run: |
+          ARTIFACT="openocd-${OPENOCD_TAG}-${{ matrix.target }}.tar.gz"
+          tar -C "${STAGING}/.." -czf "${{ github.workspace }}/${ARTIFACT}" \
+            --transform "s|^staging-${{ matrix.target }}|openocd-${OPENOCD_TAG}-${{ matrix.target }}|" \
+            "staging-${{ matrix.target }}"
+          echo "ARTIFACT=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      - name: Pack windows
+        if: startsWith(matrix.target, 'windows-')
+        run: |
+          ARTIFACT="openocd-${OPENOCD_TAG}-${{ matrix.target }}.zip"
+          STAGE_NAME="openocd-${OPENOCD_TAG}-${{ matrix.target }}"
+          rm -rf "${{ github.workspace }}/../${STAGE_NAME}"
+          cp -a "${STAGING}" "${{ github.workspace }}/../${STAGE_NAME}"
+          ( cd "${{ github.workspace }}/.." && zip -r "${{ github.workspace }}/${ARTIFACT}" "${STAGE_NAME}" )
+          echo "ARTIFACT=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openocd-${{ env.OPENOCD_TAG }}-${{ matrix.target }}
+          path: ${{ github.workspace }}/${{ env.ARTIFACT }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [meta, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_NAME: ${{ needs.meta.outputs.build_id }}
+      IS_PRE_RELEASE: ${{ needs.meta.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Pack source
+        run: |
+          set -euo pipefail
+          PREFIX="openocd-${RELEASE_NAME}-src"
+          git archive --format=tar.gz --prefix="${PREFIX}/" HEAD \
+            -o "dist/${PREFIX}.tar.gz"
+          git archive --format=zip --prefix="${PREFIX}/" HEAD \
+            -o "dist/${PREFIX}.zip"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PRE_FLAG=()
+          if [ "${IS_PRE_RELEASE}" = "true" ]; then
+            PRE_FLAG=(--prerelease)
+          fi
+          if gh release view "${RELEASE_NAME}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_NAME}" dist/* --clobber
+            exit 0
+          fi
+          gh release create "${RELEASE_NAME}" dist/* \
+            --target "${{ github.sha }}" \
+            --title "${RELEASE_NAME}" \
+            --notes "OpenOCD static builds (${RELEASE_NAME}) from ${{ github.sha }}" \
+            "${PRE_FLAG[@]}"
