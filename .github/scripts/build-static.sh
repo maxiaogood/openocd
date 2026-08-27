@@ -246,6 +246,7 @@ build_linux_native() {
   cd "${BUILD_DIR}/openocd"
   "${OPENOCD_SRC}/configure" --prefix=/usr
   make -j "${MAKE_JOBS}"
+  make check
   make install-strip DESTDIR="${BUILD_DIR}/openocd-root"
   package_tree "${BUILD_DIR}/openocd-root/usr"
   file "${STAGING}/bin/openocd"
@@ -333,6 +334,7 @@ build_linux_musl() {
   "${OPENOCD_SRC}/configure" --prefix=/usr \
     LDFLAGS="-L${PREFIX}/lib -static"
   make -j "${MAKE_JOBS}" LDFLAGS="-L${PREFIX}/lib -static -all-static"
+  make check LDFLAGS="-L${PREFIX}/lib -static -all-static"
   make install-strip DESTDIR="${BUILD_DIR}/openocd-root"
   package_tree "${BUILD_DIR}/openocd-root/usr"
   file "${STAGING}/bin/openocd"
