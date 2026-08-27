@@ -1,18 +1,39 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Build OpenOCD for linux/windows x64 and arm64, statically linking
-# third-party libraries whenever possible.
+# Linux glibc (linux-x64 / linux-arm64): static third-party libs, dynamic libc/udev.
+# Linux musl (linux-*-musl): fully static Alpine/musl binaries via Docker.
 set -euo pipefail
 set -x
 
-TARGET="${1:?usage: build-static.sh <linux-x64|linux-arm64|windows-x64|windows-arm64>}"
+TARGET="${1:?usage: build-static.sh <linux-x64|linux-arm64|linux-x64-musl|linux-arm64-musl|windows-x64|windows-arm64>}"
 : "${OPENOCD_SRC:?}"
 : "${DL_DIR:?}"
 
 MAKE_JOBS="${MAKE_JOBS:-$(nproc)}"
 STAGING="${STAGING:-${PWD}/staging-${TARGET}}"
-rm -rf "${STAGING}"
+BUILD_DIR="${BUILD_DIR:-${PWD}/../build-${TARGET}}"
+
+# Fully static musl builds run inside Alpine so the host glibc toolchain is unused.
+if [[ "${TARGET}" == linux-*-musl ]] && [[ ! -e /lib/ld-musl-x86_64.so.1 && ! -e /lib/ld-musl-aarch64.so.1 ]]; then
+  mkdir -p "${STAGING}" "${BUILD_DIR}" "${DL_DIR}"
+  root="$(cd "${OPENOCD_SRC}/.." && pwd)"
+  docker run --rm \
+    -v "${root}:${root}" \
+    -v "${DL_DIR}:${DL_DIR}" \
+    -v "${BUILD_DIR}:${BUILD_DIR}" \
+    -v "${STAGING}:${STAGING}" \
+    -e OPENOCD_SRC -e DL_DIR -e BUILD_DIR -e STAGING -e MAKE_JOBS \
+    -e OPENOCD_TAG \
+    -e LIBUSB1_SRC -e HIDAPI_SRC -e LIBFTDI_SRC \
+    -e CAPSTONE_SRC -e LIBJAYLINK_SRC -e JIMTCL_SRC \
+    -w "${OPENOCD_SRC}" \
+    "${ALPINE_IMAGE:-alpine:3.21}" \
+    sh -lc 'apk add --no-cache build-base autoconf automake libtool pkgconf cmake git bash linux-headers file && exec bash .github/scripts/build-static.sh "'"${TARGET}"'"'
+  exit $?
+fi
+
 mkdir -p "${STAGING}"
+find "${STAGING}" -mindepth 1 -delete
 
 fix_capstone_pc() {
   local pc_file="$1"
@@ -225,6 +246,97 @@ build_linux_native() {
   ldd "${STAGING}/bin/openocd" || true
 }
 
+build_linux_musl() {
+  PREFIX="${PREFIX:-${PWD}/../deps-${TARGET}}"
+  BUILD_DIR="${BUILD_DIR:-${PWD}/../build-${TARGET}}"
+  mkdir -p "${PREFIX}" "${BUILD_DIR}"
+  find "${PREFIX}" -mindepth 1 -delete
+  find "${BUILD_DIR}" -mindepth 1 -delete
+  export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PREFIX}/share/pkgconfig"
+  export CMAKE_PREFIX_PATH="${PREFIX}"
+  export CPPFLAGS="-I${PREFIX}/include"
+  export LDFLAGS="-L${PREFIX}/lib"
+  setup_pkgconfig_shim "${BUILD_DIR}/pkgconfig-shim"
+  export PKG_CONFIG="${BUILD_DIR}/pkgconfig-shim/pkg-config"
+
+  # No udev: musl/Alpine has no static libudev, and a fully static binary cannot
+  # depend on it. CMSIS-DAP still works through hidapi-libusb.
+  mkdir -p "${BUILD_DIR}/libusb1"
+  cd "${BUILD_DIR}/libusb1"
+  "${LIBUSB1_SRC}/configure" --prefix="${PREFIX}" \
+    --enable-static --disable-shared --with-pic --disable-udev
+  make -j "${MAKE_JOBS}"
+  make install
+
+  mkdir -p "${BUILD_DIR}/hidapi"
+  cd "${BUILD_DIR}/hidapi"
+  cmake "${HIDAPI_SRC}" \
+    -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+    -DCMAKE_PREFIX_PATH="${PREFIX}" \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DHIDAPI_WITH_HIDRAW=OFF \
+    -DHIDAPI_WITH_LIBUSB=ON \
+    -DHIDAPI_BUILD_HIDTEST=OFF
+  make -j "${MAKE_JOBS}"
+  make install
+
+  mkdir -p "${BUILD_DIR}/libftdi"
+  cd "${BUILD_DIR}/libftdi"
+  cmake "${LIBFTDI_SRC}" \
+    -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+    -DCMAKE_PREFIX_PATH="${PREFIX}" \
+    -DPKG_CONFIG_EXECUTABLE="${PKG_CONFIG}" \
+    -DLIB_SUFFIX= \
+    -DSTATICLIBS=OFF \
+    -DEXAMPLES=OFF \
+    -DFTDI_EEPROM=OFF \
+    -DFTDIPP=OFF \
+    -DPYTHON_BINDINGS=OFF \
+    -DBUILD_TESTS=OFF \
+    -DDOCUMENTATION=OFF
+  make -j "${MAKE_JOBS}"
+  make install
+
+  mkdir -p "${BUILD_DIR}/capstone"
+  cd "${BUILD_DIR}/capstone"
+  cp -a "${CAPSTONE_SRC}/." .
+  make -j "${MAKE_JOBS}" PREFIX="${PREFIX}" \
+    CAPSTONE_BUILD_CORE_ONLY=yes CAPSTONE_STATIC=yes CAPSTONE_SHARED=no
+  make install PREFIX="${PREFIX}" \
+    CAPSTONE_BUILD_CORE_ONLY=yes CAPSTONE_STATIC=yes CAPSTONE_SHARED=no
+  fix_capstone_pc "${PREFIX}/lib/pkgconfig/capstone.pc" "${PREFIX}"
+
+  mkdir -p "${BUILD_DIR}/libjaylink"
+  cd "${BUILD_DIR}/libjaylink"
+  "${LIBJAYLINK_SRC}/configure" --prefix="${PREFIX}" \
+    --enable-static --disable-shared --with-pic
+  make -j "${MAKE_JOBS}"
+  make install
+
+  mkdir -p "${BUILD_DIR}/jimtcl"
+  cd "${BUILD_DIR}/jimtcl"
+  "${JIMTCL_SRC}/configure" --prefix="${PREFIX}" --disable-shared \
+    --with-ext=json --minimal --disable-ssl
+  make -j "${MAKE_JOBS}"
+  make install
+
+  rm -f "${PREFIX}"/lib/*.so "${PREFIX}"/lib/*.so.*
+
+  mkdir -p "${BUILD_DIR}/openocd"
+  cd "${BUILD_DIR}/openocd"
+  "${OPENOCD_SRC}/configure" --prefix=/usr \
+    LDFLAGS="-L${PREFIX}/lib -static"
+  make -j "${MAKE_JOBS}" LDFLAGS="-L${PREFIX}/lib -static -all-static"
+  make install-strip DESTDIR="${BUILD_DIR}/openocd-root"
+  package_tree "${BUILD_DIR}/openocd-root/usr"
+  file "${STAGING}/bin/openocd"
+  if ! file "${STAGING}/bin/openocd" | grep -qi 'statically linked'; then
+    echo "error: musl binary is not fully static" >&2
+    ldd "${STAGING}/bin/openocd" || true
+    exit 1
+  fi
+}
+
 case "${TARGET}" in
   windows-x64)
     build_windows x86_64-w64-mingw32
@@ -234,6 +346,9 @@ case "${TARGET}" in
     ;;
   linux-x64|linux-arm64)
     build_linux_native
+    ;;
+  linux-x64-musl|linux-arm64-musl)
+    build_linux_musl
     ;;
   *)
     echo "unknown target: ${TARGET}" >&2

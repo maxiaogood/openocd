@@ -48,6 +48,12 @@ jobs:
           - target: linux-arm64
             runner: ubuntu-24.04-arm
             extra_packages: libudev-dev
+          - target: linux-x64-musl
+            runner: ubuntu-latest
+            extra_packages: ""
+          - target: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            extra_packages: ""
           - target: windows-x64
             runner: ubuntu-latest
             extra_packages: g++-mingw-w64-x86-64
