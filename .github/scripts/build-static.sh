@@ -157,6 +157,12 @@ build_windows() {
   setup_pkgconfig_shim "${BUILD_DIR}/pkgconfig-shim"
   if "${host}-gcc" --version 2>/dev/null | grep -qi clang; then
     setup_clang_flag_filter "${host}" "${BUILD_DIR}/clang-flag-filter"
+    # Clang diagnoses more than GCC (e.g. FD_SET sign-compare in libjaylink),
+    # and several dependencies build with -Werror.
+    export CFLAGS="${CFLAGS:-} -O2 -Wno-error"
+    export CXXFLAGS="${CXXFLAGS:-} -O2 -Wno-error"
+    OPENOCD_CONFIG="${OPENOCD_CONFIG} --disable-werror"
+    export OPENOCD_CONFIG
   fi
   cd "${BUILD_DIR}"
   bash "${OPENOCD_SRC}/contrib/cross-build.sh" "${host}"
